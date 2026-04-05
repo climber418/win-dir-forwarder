@@ -26,6 +26,7 @@ use windows::Win32::System::Com::IDispatch;
 
 use std::env;
 use std::process::Command;
+use std::path::Path;
 
 
 unsafe fn get_selected_file_from_explorer() -> Result<String> {
@@ -179,6 +180,23 @@ unsafe fn get_base_location_from_shellview(shell_view: IShellView) -> String {
     base_path
 }
 
+// Check if the executable is MSYS2 or Git Bash that needs CHERE_INVOKING
+fn is_msys_or_gitbash(exe_path: &str) -> bool {
+    let exe_lower = exe_path.to_lowercase();
+    let file_name = Path::new(&exe_lower)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    matches!(file_name,
+        "clang64.exe" |
+        "clangarm64.exe" |
+        "mingw64.exe" |
+        "msys.exe" |
+        "ucrt64.exe"
+    )
+}
+
 fn main() -> Result<()> {
 
     // Initialize logging from the configuration file
@@ -227,13 +245,20 @@ fn main() -> Result<()> {
     let result = unsafe { get_selected_file_from_explorer() };
     match result {
         Ok(path) => {
+            let needs_msys_env = is_msys_or_gitbash(&target_exe);
+
             if path.is_empty() {
                 warn!("Explorer directory path is empty, launching without setting working directory");
                 // Launch without setting working directory
-                match Command::new(&target_exe)
-                    .args(target_args)
-                    .spawn()
-                {
+                let mut cmd = Command::new(&target_exe);
+                cmd.args(target_args);
+
+                if needs_msys_env {
+                    cmd.env("CHERE_INVOKING", "1")
+                       .env("MSYS2_PATH_TYPE", "inherit");
+                }
+
+                match cmd.spawn() {
                     Ok(child) => {
                         info!("Successfully launched {} with PID: {} (no working directory set)", &target_exe, child.id());
                     }
@@ -245,11 +270,17 @@ fn main() -> Result<()> {
                 info!("Working directory from Explorer: {}", path);
 
                 // Launch the target executable with the specified working directory
-                match Command::new(&target_exe)
-                    .args(target_args)
-                    .current_dir(&path)
-                    .spawn()
-                {
+                // For MSYS2/Git Bash, set CHERE_INVOKING=1 to prevent cd to home directory
+                let mut cmd = Command::new(&target_exe);
+                cmd.args(target_args).current_dir(&path);
+
+                if needs_msys_env {
+                    info!("Detected MSYS2/Git Bash shell, setting CHERE_INVOKING environment");
+                    cmd.env("CHERE_INVOKING", "1")
+                       .env("MSYS2_PATH_TYPE", "inherit");
+                }
+
+                match cmd.spawn() {
                     Ok(child) => {
                         info!("Successfully launched {} with PID: {} in directory: {}", &target_exe, child.id(), path);
                     }
@@ -262,11 +293,19 @@ fn main() -> Result<()> {
         Err(e) => {
             error!("Error getting directory from Explorer: {:?}", e);
             warn!("Attempting to launch {} without setting working directory", &target_exe);
+
+            let needs_msys_env = is_msys_or_gitbash(&target_exe);
+
             // Try to launch anyway without setting working directory
-            match Command::new(&target_exe)
-                .args(target_args)
-                .spawn()
-            {
+            let mut cmd = Command::new(&target_exe);
+            cmd.args(target_args);
+
+            if needs_msys_env {
+                cmd.env("CHERE_INVOKING", "1")
+                   .env("MSYS2_PATH_TYPE", "inherit");
+            }
+
+            match cmd.spawn() {
                 Ok(child) => {
                     info!("Successfully launched {} with PID: {} (fallback mode)", &target_exe, child.id());
                 }
