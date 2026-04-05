@@ -24,48 +24,79 @@ use windows::Win32::{
 use windows::core::PCWSTR;
 use windows::Win32::System::Com::IDispatch;
 
+use std::env;
+use std::process::Command;
+
 
 unsafe fn get_selected_file_from_explorer() -> Result<String> {
+	info!("get_selected_file_from_explorer:-->");
+
+    info!("Initializing COM");
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
+    info!("Getting foreground window handle");
     let hwnd_gfw = GetForegroundWindow();
+    info!("Foreground window handle: {:?}", hwnd_gfw);
+
+    info!("Creating ShellWindows instance");
     let shell_windows: IShellWindows =
         CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
-    let result_hwnd = FindWindowExW(Some(hwnd_gfw), None, w!("ShellTabWindowClass"), None)?;
+
+    info!("Finding ShellTabWindowClass");
+    let result_hwnd = match FindWindowExW(Some(hwnd_gfw), None, w!("ShellTabWindowClass"), None) {
+        Ok(hwnd) => {
+            info!("ShellTabWindowClass handle: {:?}", hwnd);
+            hwnd
+        }
+        Err(e) => {
+            info!("ShellTabWindowClass not found: {:?}, using foreground window", e);
+            hwnd_gfw
+        }
+    };
 
     let mut target_path = String::new();
     let count = shell_windows.Count().unwrap_or_default();
+    info!("Total shell windows count: {}", count);
 
     for i in 0..count {
+        info!("Processing shell window index: {}", i);
         let variant = VARIANT::from(i);
         let dispatch: IDispatch = shell_windows.Item(&variant)?;
 
         let shell_browser = dispath2browser(dispatch);
 
         if shell_browser.is_none() {
+            info!("Shell browser is None for index {}, skipping", i);
             continue;
         }
         let shell_browser = shell_browser.unwrap();
+        info!("Successfully got shell browser for index {}", i);
+
         // 调用 GetWindow 可能会阻塞 GUI 消息
         let phwnd = shell_browser.GetWindow()?;
-        if hwnd_gfw.0 != phwnd.0 && result_hwnd.0 != phwnd.0 {
-            continue;
-        }
+        info!("Shell browser window handle: {:?}", phwnd);
 
-        let shell_view = shell_browser.QueryActiveShellView().unwrap();
-        target_path = get_base_location_from_shellview(shell_view); // get_selected_file_path_from_shellview(shell_view);
+        if hwnd_gfw.0 == phwnd.0 || result_hwnd.0 == phwnd.0 {
+            info!("Window handle matched for index {} (foreground: {:?}, target: {:?}, current: {:?})",
+                  i, hwnd_gfw, result_hwnd, phwnd);
+			let shell_view = shell_browser.QueryActiveShellView().unwrap();
+            target_path = get_base_location_from_shellview(shell_view);
+            info!("Retrieved base location: {}", target_path);
+			break;
+        } else {
+            info!("Window handle mismatch for index {}, skipping (foreground: {:?}, target: {:?}, current: {:?})",
+                  i, hwnd_gfw, result_hwnd, phwnd);
+        }
     }
-    info!("get_selected_file_from_explorer: {}",target_path);
+    info!("get_selected_file_from_explorer:<-- {}",target_path);
     Ok(target_path)
 }
 
 unsafe fn dispath2browser(dispatch: IDispatch) -> Option<IShellBrowser> {
     
     let mut service_provider: Option<IServiceProvider> = None;
-    dispatch
-        .query(
-            &IServiceProvider::IID,
-            &mut service_provider as *mut _ as *mut _,
+    dispatch.query(&IServiceProvider::IID,
+	    &mut service_provider as *mut _ as *mut _,
         )
         .ok()
         .unwrap();
@@ -111,10 +142,8 @@ unsafe fn get_selected_file_path_from_shellview(shell_view: IShellView) -> Strin
         }
 
         if let Ok(display_name) = shell_item.GetDisplayName(SIGDN_FILESYSPATH) {
-            println!("display_name: {:?}", display_name);
             let tmp = display_name.to_string();
             if tmp.is_err() {
-                println!("display_name error: {:?}", tmp.err());
                 continue;
             }
             target_path = tmp.unwrap();
@@ -161,7 +190,7 @@ fn main() -> Result<()> {
     // Create a file appender with the custom encoder
     let file_appender = FileAppender::builder()
         .encoder(json_encoder)
-        .build("d:\\myproject\\win-dir-forwarder\\logs\\log.json")
+        .build("d:\\myproject\\win-dir-forwarder\\logs\\log.txt")
         .unwrap();
 
     // Create a log configuration with the file appender
@@ -173,24 +202,80 @@ fn main() -> Result<()> {
     // Initialize the logger
     log4rs::init_config(config).unwrap();
 
-    // Log some messages
-    info!("This is an info message.-------------->");
-    warn!("This is a warning message.");
-    error!("This is an error message.");
+    // Parse command line arguments
+    let args: Vec<String> = env::args().collect();
+    info!("Command line arguments:{}: {:?}",args.len(), args);
 
+    // If no arguments, use the executable itself as target
+    let target_exe = if args.len() >= 1 {
+        args[1].clone()
+    } else {
+        info!("No target executable specified, using self as target");
+        return Ok(());
+    };
 
+    let target_args = if args.len() >= 2 {
+        &args[2..]
+    } else {
+        &[]
+    };
+
+    info!("Target executable: {}", &target_exe);
+    info!("Target arguments: {:?}", target_args);
+
+    // Get the current directory from Explorer
     let result = unsafe { get_selected_file_from_explorer() };
     match result {
         Ok(path) => {
-            info!("result is {:?} <-------------------", path);
-            let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-            unsafe {
-                MessageBoxW(None, PCWSTR(wide_path.as_ptr()), w!("Selected File"), MB_ICONINFORMATION | MB_OK);
+            if path.is_empty() {
+                warn!("Explorer directory path is empty, launching without setting working directory");
+                // Launch without setting working directory
+                match Command::new(&target_exe)
+                    .args(target_args)
+                    .spawn()
+                {
+                    Ok(child) => {
+                        info!("Successfully launched {} with PID: {} (no working directory set)", &target_exe, child.id());
+                    }
+                    Err(e) => {
+                        error!("Failed to launch {}: {:?}", &target_exe, e);
+                    }
+                }
+            } else {
+                info!("Working directory from Explorer: {}", path);
+
+                // Launch the target executable with the specified working directory
+                match Command::new(&target_exe)
+                    .args(target_args)
+                    .current_dir(&path)
+                    .spawn()
+                {
+                    Ok(child) => {
+                        info!("Successfully launched {} with PID: {} in directory: {}", &target_exe, child.id(), path);
+                    }
+                    Err(e) => {
+                        error!("Failed to launch {} in directory {}: {:?}", &target_exe, path, e);
+                    }
+                }
             }
         }
         Err(e) => {
-            error!("Error getting selected file: {:?}", e);
+            error!("Error getting directory from Explorer: {:?}", e);
+            warn!("Attempting to launch {} without setting working directory", &target_exe);
+            // Try to launch anyway without setting working directory
+            match Command::new(&target_exe)
+                .args(target_args)
+                .spawn()
+            {
+                Ok(child) => {
+                    info!("Successfully launched {} with PID: {} (fallback mode)", &target_exe, child.id());
+                }
+                Err(e) => {
+                    error!("Failed to launch {} in fallback mode: {:?}", &target_exe, e);
+                }
+            }
         }
     }
+
     Ok(())
 }
