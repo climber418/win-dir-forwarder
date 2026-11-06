@@ -4,8 +4,9 @@ use log::{info, warn, error};
 use log4rs;
 use log4rs::{append::file::FileAppender, config::{Appender, Root}, encode::pattern::PatternEncoder, Config};
 
-use windows::core::{Interface, Result, w};
+use windows::core::{Interface, Result};
 use windows::Win32::{
+    Foundation::{BOOL, HWND, LPARAM},
     System::{
         Com::{
             CoCreateInstance, CoInitializeEx, CLSCTX_LOCAL_SERVER,
@@ -17,9 +18,13 @@ use windows::Win32::{
     UI::Shell::{
         IShellBrowser, IShellWindows, IShellView, IShellItem, IFolderView,
         ShellWindows, SIGDN_FILESYSPATH, SIGDN_DESKTOPABSOLUTEPARSING, SVGIO_SELECTION,
-        IShellItemArray
+        IShellItemArray, IShellFolderViewDual, Folder2, IWebBrowser2,
     },
-    UI::WindowsAndMessaging::{GetForegroundWindow, FindWindowExW, MessageBoxW, MB_ICONINFORMATION, MB_OK},
+    UI::WindowsAndMessaging::{
+        GetForegroundWindow, MessageBoxW, MB_ICONINFORMATION, MB_OK,
+        EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetWindowTextW,
+        IsIconic, IsWindowVisible, GA_ROOTOWNER,
+    },
 };
 use windows::core::PCWSTR;
 use windows::Win32::System::Com::IDispatch;
@@ -29,94 +34,304 @@ use std::process::Command;
 use std::path::Path;
 
 
-unsafe fn get_selected_file_from_explorer() -> Result<String> {
-	info!("get_selected_file_from_explorer:-->");
+/// 标签页窗口类名：Windows 11 中每个标签页都是一个该类的子窗口
+const TAB_CLASS: &str = "ShellTabWindowClass";
+
+#[derive(Default)]
+struct TabSearch {
+    active: Option<HWND>,
+    first: Option<HWND>,
+}
+
+unsafe extern "system" fn find_tab_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = &mut *(lparam.0 as *mut TabSearch);
+
+    let mut class_name = [0u16; 64];
+    let len = GetClassNameW(hwnd, &mut class_name);
+    if len <= 0 || String::from_utf16_lossy(&class_name[..len as usize]) != TAB_CLASS {
+        return true.into();
+    }
+
+    if IsWindowVisible(hwnd).as_bool() {
+        // 可见的标签页就是当前激活的标签页，无需继续枚举
+        search.active = Some(hwnd);
+        return false.into();
+    }
+    if search.first.is_none() {
+        search.first = Some(hwnd);
+    }
+    true.into()
+}
+
+/// 找出框架窗口下当前激活的标签页窗口
+unsafe fn active_tab(frame: HWND) -> Option<HWND> {
+    let mut search = TabSearch::default();
+    let _ = EnumChildWindows(
+        Some(frame),
+        Some(find_tab_cb),
+        LPARAM(&mut search as *mut _ as isize),
+    );
+    search.active.or(search.first)
+}
+
+/// 读取 Shell 窗口项所属的框架窗口句柄（等价于 AHK 的 window.hwnd）
+unsafe fn frame_of(dispatch: &IDispatch) -> Option<HWND> {
+    let web_browser: IWebBrowser2 = dispatch.cast().ok()?;
+    let hwnd = web_browser.HWND().ok()?.0;
+    if hwnd == 0 {
+        None
+    } else {
+        Some(HWND(hwnd as *mut core::ffi::c_void))
+    }
+}
+
+struct ShellWindow {
+    dispatch: IDispatch,
+    browser: IShellBrowser,
+    frame: Option<HWND>,
+    tab: HWND,
+}
+
+struct TopmostSearch<'a> {
+    windows: &'a [ShellWindow],
+    found: Option<usize>,
+}
+
+/// EnumWindows 按 Z 序枚举（最近激活的在前），取第一个可见的候选窗口
+unsafe extern "system" fn topmost_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = &mut *(lparam.0 as *mut TopmostSearch);
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        return true.into();
+    }
+    let matched = search
+        .windows
+        .iter()
+        .position(|w| w.frame.map_or(false, |f| f.0 == hwnd.0));
+    if let Some(index) = matched {
+        search.found = Some(index);
+        return false.into();
+    }
+    true.into()
+}
+
+unsafe fn window_desc(hwnd: HWND) -> String {
+    let mut class_name = [0u16; 128];
+    let class_len = GetClassNameW(hwnd, &mut class_name).max(0) as usize;
+    let mut title = [0u16; 256];
+    let title_len = GetWindowTextW(hwnd, &mut title).max(0) as usize;
+    format!(
+        "{} / {}",
+        String::from_utf16_lossy(&class_name[..class_len]),
+        String::from_utf16_lossy(&title[..title_len])
+    )
+}
+
+unsafe fn collect_windows(shell_windows: &IShellWindows) -> Vec<ShellWindow> {
+    let count = shell_windows.Count().unwrap_or_default();
+    info!("Total shell windows count: {}", count);
+
+    let mut windows = Vec::new();
+    for i in 0..count {
+        let variant = VARIANT::from(i);
+        let dispatch: IDispatch = match shell_windows.Item(&variant) {
+            Ok(dispatch) => dispatch,
+            Err(e) => {
+                warn!("Failed to get shell window index {}: {:?}", i, e);
+                continue;
+            }
+        };
+
+        let browser = match to_browser(&dispatch) {
+            Some(browser) => browser,
+            None => {
+                info!("Shell browser is None for index {}, skipping", i);
+                continue;
+            }
+        };
+
+        let tab = match browser.GetWindow() {
+            Ok(hwnd) => hwnd,
+            Err(e) => {
+                warn!("GetWindow failed for index {}: {:?}", i, e);
+                continue;
+            }
+        };
+        let frame = frame_of(&dispatch);
+
+        info!("Shell window {}: frame={:?}, tab={:?}", i, frame, tab);
+        windows.push(ShellWindow {
+            dispatch,
+            browser,
+            frame,
+            tab,
+        });
+    }
+    windows
+}
+
+/// 同一框架窗口下有多个标签页时，挑出当前激活的那个
+unsafe fn pick_tab<'a>(windows: &'a [ShellWindow], frame: HWND) -> Option<&'a ShellWindow> {
+    let on_frame = |w: &&ShellWindow| w.frame.map_or(false, |f| f.0 == frame.0);
+
+    if let Some(tab) = active_tab(frame) {
+        if let Some(target) = windows.iter().find(|w| on_frame(w) && w.tab.0 == tab.0) {
+            return Some(target);
+        }
+    }
+    windows.iter().find(on_frame)
+}
+
+/// 找到前台窗口对应的浏览对象。
+/// AHK 用 window.hwnd（框架窗口）和前台窗口比较，而 IShellBrowser::GetWindow
+/// 返回的是标签页窗口，所以两者都参与匹配；多个标签页共享框架窗口时再按激活标签页筛选。
+/// 如果前台窗口不是 Explorer（例如经由启动器、命令窗口触发），退回到 Z 序最靠前的
+/// 可见 Explorer 窗口，也就是最近使用过的那个窗口。
+unsafe fn find_browser(
+    shell_windows: &IShellWindows,
+    fg: HWND,
+) -> Option<(IDispatch, IShellBrowser)> {
+    let windows = collect_windows(shell_windows);
+    if windows.is_empty() {
+        warn!("No shell window candidate found");
+        return None;
+    }
+
+    // 1. 前台窗口本身就是 Shell 窗口，或者是 Shell 窗口的弹出窗口
+    let root_owner = GetAncestor(fg, GA_ROOTOWNER);
+    for window in &windows {
+        if let Some(frame) = window.frame {
+            if frame.0 == fg.0 || frame.0 == root_owner.0 {
+                let target = pick_tab(&windows, frame)?;
+                return Some((target.dispatch.clone(), target.browser.clone()));
+            }
+        }
+        if window.tab.0 == fg.0 {
+            return Some((window.dispatch.clone(), window.browser.clone()));
+        }
+    }
+
+    // 2. 前台窗口不是 Explorer，取最近激活的 Explorer 窗口
+    let mut search = TopmostSearch {
+        windows: &windows,
+        found: None,
+    };
+    let _ = EnumWindows(
+        Some(topmost_cb),
+        LPARAM(&mut search as *mut _ as isize),
+    );
+
+    let index = match search.found {
+        Some(index) => index,
+        None => {
+            warn!("All shell windows are hidden or minimized");
+            return None;
+        }
+    };
+    let window = &windows[index];
+    let frame = window.frame?;
+    info!(
+        "Foreground window is not explorer, using most recently used frame: {:?}",
+        frame
+    );
+    let target = pick_tab(&windows, frame).unwrap_or(window);
+    Some((target.dispatch.clone(), target.browser.clone()))
+}
+
+/// 取窗口所属的文档对象，即 AHK 里的 window.document
+unsafe fn document_view(dispatch: &IDispatch) -> Option<IShellFolderViewDual> {
+    if let Ok(view) = dispatch.cast::<IShellFolderViewDual>() {
+        return Some(view);
+    }
+    let web_browser: IWebBrowser2 = dispatch.cast().ok()?;
+    web_browser.Document().ok()?.cast().ok()
+}
+
+/// 等价于 AHK 的 window.document.Folder.Self.Path
+unsafe fn folder_path(dispatch: &IDispatch) -> String {
+    let view = match document_view(dispatch) {
+        Some(view) => view,
+        None => {
+            warn!("IShellFolderViewDual is not available for this shell window");
+            return String::new();
+        }
+    };
+    let folder = match view.Folder() {
+        Ok(folder) => folder,
+        Err(e) => {
+            warn!("Failed to get folder from shell view: {:?}", e);
+            return String::new();
+        }
+    };
+    // Self 属性定义在 Folder2 上
+    let item = match folder.cast::<Folder2>().and_then(|folder2| folder2.Self_()) {
+        Ok(item) => item,
+        Err(e) => {
+            warn!("Failed to get folder self item: {:?}", e);
+            return String::new();
+        }
+    };
+    match item.Path() {
+        Ok(path) => path.to_string(),
+        Err(e) => {
+            warn!("Failed to get folder path: {:?}", e);
+            String::new()
+        }
+    }
+}
+
+unsafe fn explorer_path() -> Result<String> {
+    info!("explorer_path:-->");
 
     info!("Initializing COM");
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
     info!("Getting foreground window handle");
-    let hwnd_gfw = GetForegroundWindow();
-    info!("Foreground window handle: {:?}", hwnd_gfw);
+    let fg = GetForegroundWindow();
+    info!(
+        "Foreground window handle: {:?} ({})",
+        fg,
+        window_desc(fg)
+    );
+    if fg.0.is_null() {
+        warn!("No foreground window, cannot resolve explorer directory");
+        return Ok(String::new());
+    }
 
     info!("Creating ShellWindows instance");
     let shell_windows: IShellWindows =
         CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
 
-    info!("Finding ShellTabWindowClass");
-    let result_hwnd = match FindWindowExW(Some(hwnd_gfw), None, w!("ShellTabWindowClass"), None) {
-        Ok(hwnd) => {
-            info!("ShellTabWindowClass handle: {:?}", hwnd);
-            hwnd
+    let mut path = String::new();
+    match find_browser(&shell_windows, fg) {
+        Some((dispatch, browser)) => {
+            path = folder_path(&dispatch);
+            if path.is_empty() {
+                warn!("Folder self path is empty, falling back to shell view folder");
+                if let Ok(shell_view) = browser.QueryActiveShellView() {
+                    path = view_folder_path(shell_view);
+                }
+            }
         }
-        Err(e) => {
-            info!("ShellTabWindowClass not found: {:?}, using foreground window", e);
-            hwnd_gfw
-        }
-    };
-
-    let mut target_path = String::new();
-    let count = shell_windows.Count().unwrap_or_default();
-    info!("Total shell windows count: {}", count);
-
-    for i in 0..count {
-        info!("Processing shell window index: {}", i);
-        let variant = VARIANT::from(i);
-        let dispatch: IDispatch = shell_windows.Item(&variant)?;
-
-        let shell_browser = dispath2browser(dispatch);
-
-        if shell_browser.is_none() {
-            info!("Shell browser is None for index {}, skipping", i);
-            continue;
-        }
-        let shell_browser = shell_browser.unwrap();
-        info!("Successfully got shell browser for index {}", i);
-
-        // 调用 GetWindow 可能会阻塞 GUI 消息
-        let phwnd = shell_browser.GetWindow()?;
-        info!("Shell browser window handle: {:?}", phwnd);
-
-        if hwnd_gfw.0 == phwnd.0 || result_hwnd.0 == phwnd.0 {
-            info!("Window handle matched for index {} (foreground: {:?}, target: {:?}, current: {:?})",
-                  i, hwnd_gfw, result_hwnd, phwnd);
-			let shell_view = shell_browser.QueryActiveShellView().unwrap();
-            target_path = get_base_location_from_shellview(shell_view);
-            info!("Retrieved base location: {}", target_path);
-			break;
-        } else {
-            info!("Window handle mismatch for index {}, skipping (foreground: {:?}, target: {:?}, current: {:?})",
-                  i, hwnd_gfw, result_hwnd, phwnd);
-        }
+        None => warn!("No shell window matches the foreground window"),
     }
-    info!("get_selected_file_from_explorer:<-- {}",target_path);
-    Ok(target_path)
+
+    info!("explorer_path:<-- {}", path);
+    Ok(path)
 }
 
-unsafe fn dispath2browser(dispatch: IDispatch) -> Option<IShellBrowser> {
-    
-    let mut service_provider: Option<IServiceProvider> = None;
-    dispatch.query(&IServiceProvider::IID,
-	    &mut service_provider as *mut _ as *mut _,
-        )
-        .ok()
-        .unwrap();
-    if service_provider.is_none() {
-        return None;
-    }
-    let shell_browser = service_provider
-        .unwrap()
+unsafe fn to_browser(dispatch: &IDispatch) -> Option<IShellBrowser> {
+    let service_provider: IServiceProvider = dispatch.cast().ok()?;
+    service_provider
         .QueryService::<IShellBrowser>(&IShellBrowser::IID)
-        .ok();
-    shell_browser
+        .ok()
 }
 
-unsafe fn get_selected_file_path_from_shellview(shell_view: IShellView) -> String {
-    let mut target_path = String::new();
+unsafe fn selected_file_path(shell_view: IShellView) -> String {
+    let mut path = String::new();
     let shell_items = shell_view.GetItemObject::<IShellItemArray>(SVGIO_SELECTION);
 
     if shell_items.is_err() {
-        return target_path;
+        return path;
     }
     info!("shell_items: {:?}", shell_items);
     let shell_items = shell_items.unwrap();
@@ -138,7 +353,7 @@ unsafe fn get_selected_file_path_from_shellview(shell_view: IShellView) -> Strin
             if tmp.is_err() {
                 continue;
             }
-            target_path = tmp.unwrap();
+            path = tmp.unwrap();
             break;
         }
 
@@ -147,16 +362,16 @@ unsafe fn get_selected_file_path_from_shellview(shell_view: IShellView) -> Strin
             if tmp.is_err() {
                 continue;
             }
-            target_path = tmp.unwrap();
+            path = tmp.unwrap();
             break;
         }
         
     }
-    target_path
+    path
 }
 
-unsafe fn get_base_location_from_shellview(shell_view: IShellView) -> String {
-    let mut base_path = String::new();
+unsafe fn view_folder_path(shell_view: IShellView) -> String {
+    let mut path = String::new();
     
     // Try to get the current folder from the shell view
     // We need to query for IFolderView interface to get folder information
@@ -165,19 +380,19 @@ unsafe fn get_base_location_from_shellview(shell_view: IShellView) -> String {
             // Try to get the file system path first
             if let Ok(display_name) = folder.GetDisplayName(SIGDN_FILESYSPATH) {
                 if let Ok(path_str) = display_name.to_string() {
-                    base_path = path_str;
+                    path = path_str;
                 }
             }
             // Fallback to desktop absolute parsing name
             else if let Ok(display_name) = folder.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) {
                 if let Ok(path_str) = display_name.to_string() {
-                    base_path = path_str;
+                    path = path_str;
                 }
             }
         }
     }
     
-    base_path
+    path
 }
 
 // Check if the executable is MSYS2 or Git Bash that needs CHERE_INVOKING
@@ -242,7 +457,7 @@ fn main() -> Result<()> {
     info!("Target arguments: {:?}", target_args);
 
     // Get the current directory from Explorer
-    let result = unsafe { get_selected_file_from_explorer() };
+    let result = unsafe { explorer_path() };
     match result {
         Ok(path) => {
             let needs_msys_env = is_msys_or_gitbash(&target_exe);

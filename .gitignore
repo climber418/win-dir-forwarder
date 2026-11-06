@@ -18,3 +18,5 @@ log.json
 *.tmp
 *.swp
 *~
+
+logs/
